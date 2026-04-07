@@ -1,289 +1,123 @@
 #!/usr/bin/env node
-/**
- * Quran MCP Server
- * Powered by alislam.org/quran/app (Ahmadiyya Muslim Community)
- */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import {
-  getVerses,
-  getChapterIntro,
-  searchQuran,
-  CHAPTERS,
-  type VerseOptions,
-  type Verse,
-  type TranslationId,
-} from "./quran-api.js";
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { Cache } from './cache.js';
+import { handleGetVerse } from './tools/get-verse.js';
+import { handleGetSurahInfo } from './tools/get-surah-info.js';
+import { handleListSurahs } from './tools/list-surahs.js';
+import { handleSearchQuran } from './tools/search-quran.js';
+import { handleGetTopics } from './tools/get-topics.js';
+import { handleGetCommentary } from './tools/get-commentary.js';
+import { handleSearchByTheme } from './tools/search-by-theme.js';
+import { SEED_CHAPTERS } from './types.js';
+import { fetchVerses, fetchIntro } from './api.js';
+import { getSurahMeta } from './data/surah-index.js';
 
-// ---------------------------------------------------------------------------
-// Server setup
-// ---------------------------------------------------------------------------
+const cache = new Cache();
 
 const server = new McpServer({
-  name: "quran-mcp",
-  version: "0.1.0",
+  name: 'quran-mcp',
+  version: '0.1.0',
 });
 
-// ---------------------------------------------------------------------------
-// Shared schemas
-// ---------------------------------------------------------------------------
+server.tool('list_surahs', 'List all 114 surahs with names, verse counts, and revelation type', {}, async () => {
+  return handleListSurahs();
+});
 
-const TranslationSchema = z
-  .enum(["en", "zk", "sc", "v5", "ur", "ts", "fr", "es", "de", "it", "my", "bn", "cn", "nw", "sv"])
-  .describe(
-    "Translation ID: en=Maulawi Sher Ali (English, default), zk=Zafrulla Khan (English), " +
-    "sc=Short Commentary (English), v5=Five Volume Commentary (English), " +
-    "ur=Urdu (Mirza Tahir Ahmad), ts=Tafsir Saghir (Urdu), fr=French, es=Spanish, " +
-    "de=German, it=Italian, my=Myanmar, bn=Bangla, cn=Chinese, nw=Norwegian, sv=Swedish"
-  );
+server.tool('get_verse', 'Get Quran verse(s) with Arabic, English (Sher Ali), Urdu translations and commentary', {
+  chapter: z.number().int().min(1).max(114).describe('Surah number (1-114)'),
+  verse: z.string().describe('Verse number or range (e.g., "1" or "1-5")'),
+}, async (args) => {
+  return handleGetVerse(args, cache);
+});
 
-/** Convert a comma-separated translation string to VerseOptions */
-function buildOptions(translations: string): VerseOptions {
-  const ids = translations.split(",").map((t) => t.trim()) as TranslationId[];
-  const opts: VerseOptions = {};
-  for (const id of ids) {
-    (opts as Record<string, boolean>)[id] = true;
-  }
-  return opts;
-}
+server.tool('get_surah_info', 'Get surah metadata and chapter introduction', {
+  chapter: z.number().int().min(1).max(114).describe('Surah number (1-114)'),
+}, async (args) => {
+  return handleGetSurahInfo(args, cache);
+});
 
-// ---------------------------------------------------------------------------
-// Helper: format verses as readable text
-// ---------------------------------------------------------------------------
+server.tool('search_quran', 'Search cached Quran verses by keyword', {
+  query: z.string().describe('Search query'),
+  search_in: z.enum(['arabic', 'english', 'urdu', 'commentary', 'all']).optional().default('all')
+    .describe('Which fields to search'),
+}, async (args) => {
+  return handleSearchQuran(args, cache);
+});
 
-function formatVerses(verses: Verse[], translations: string): string {
-  const ids = translations.split(",").map((t) => t.trim()) as TranslationId[];
-  return verses
-    .map((v) => {
-      const ref = `[${v.ch}:${v.v}]`;
-      const lines: string[] = [ref];
-      if (v.ar) lines.push(`Arabic: ${v.ar.replace(/<[^>]+>/g, "")}`);
-      for (const id of ids) {
-        const t = v[id as keyof Verse] as { text: string; notes: Array<{ ref: string; note: string }> } | undefined;
-        if (t?.text) {
-          const label = id.toUpperCase();
-          const clean = t.text.replace(/<[^>]+>/g, "").replace(/\[([a-z\d]+)\]/g, "").trim();
-          lines.push(`${label}: ${clean}`);
-          // Append footnotes inline if present
-          if (t.notes.length > 0) {
-            const noteLines = t.notes
-              .map((n) => `  [${n.ref}] ${n.note.replace(/<[^>]+>/g, "").trim()}`)
-              .join("\n");
-            lines.push(noteLines);
-          }
-        }
-      }
-      if (v.topics && v.topics.length > 0) {
-        lines.push(`Topics: ${v.topics.map((tp) => tp.topic.replace(/<[^>]+>/g, "")).join("; ")}`);
-      }
-      return lines.join("\n");
-    })
-    .join("\n\n");
-}
+server.tool('get_topics', 'Get cross-reference topics and related verses', {
+  chapter: z.number().int().min(1).max(114).describe('Surah number (1-114)'),
+  verse: z.number().int().min(1).describe('Verse number'),
+}, async (args) => {
+  return handleGetTopics(args, cache);
+});
 
-// ---------------------------------------------------------------------------
-// Tool: list_chapters
-// ---------------------------------------------------------------------------
+server.tool('get_commentary', 'Get commentary for a verse (Five Volume, Short, Tafsir Saghir)', {
+  chapter: z.number().int().min(1).max(114).describe('Surah number (1-114)'),
+  verse: z.number().int().min(1).describe('Verse number'),
+  type: z.enum(['five_volume', 'short', 'tafsir_saghir', 'all']).optional().default('all')
+    .describe('Commentary type'),
+}, async (args) => {
+  return handleGetCommentary(args, cache);
+});
 
-server.tool(
-  "list_chapters",
-  "List all 114 chapters (surahs) of the Holy Quran with their names, verse counts, and revelation type.",
-  {
-    filter: z
-      .string()
-      .optional()
-      .describe("Optional keyword to filter by name (e.g. 'al', 'maryam')"),
-  },
-  async ({ filter }) => {
-    let chapters = CHAPTERS;
-    if (filter) {
-      const q = filter.toLowerCase();
-      chapters = CHAPTERS.filter(
-        (c) => c.name.toLowerCase().includes(q) || c.arabic.includes(q)
-      );
+server.tool('search_by_theme', 'Find verses by theme using AI-powered search (requires internet)', {
+  theme: z.string().describe('Theme or concept to search for (e.g., "patience", "mercy", "prayer")'),
+}, async (args) => {
+  return handleSearchByTheme(args);
+});
+
+async function seedCache() {
+  const status = await cache.getStatus();
+  if (status.seed_complete || status.seed_in_progress) return;
+
+  await cache.updateStatus({ seed_in_progress: true });
+
+  for (const ch of SEED_CHAPTERS) {
+    if (await cache.isChapterCached(ch)) continue;
+    try {
+      const meta = getSurahMeta(ch);
+      if (!meta) continue;
+      const verses = await fetchVerses(ch, 1, meta.verse_count);
+      await cache.saveChapter({
+        chapter: ch,
+        name_arabic: meta.name_arabic,
+        name_english: meta.name_english,
+        verse_count: meta.verse_count,
+        cached_at: new Date().toISOString(),
+        verses,
+      });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (err) {
+      console.error(`Failed to seed chapter ${ch}:`, err);
     }
-    const text = chapters
-      .map(
-        (c) =>
-          `${c.number}. ${c.name} (${c.arabic}) — ${c.verses} verses — ${c.type}`
-      )
-      .join("\n");
-    return { content: [{ type: "text", text }] };
   }
-);
 
-// ---------------------------------------------------------------------------
-// Tool: get_verses
-// ---------------------------------------------------------------------------
-
-server.tool(
-  "get_verses",
-  "Retrieve one or more verses from a chapter of the Holy Quran with translations and footnotes.",
-  {
-    chapter: z
-      .number()
-      .int()
-      .min(1)
-      .max(114)
-      .describe("Chapter (surah) number, 1–114"),
-    from_verse: z
-      .number()
-      .int()
-      .min(1)
-      .describe("Starting verse number (1-based)"),
-    to_verse: z
-      .number()
-      .int()
-      .min(1)
-      .describe("Ending verse number (inclusive). Use the same value as from_verse for a single verse."),
-    translations: z
-      .string()
-      .optional()
-      .default("en")
-      .describe(
-        "Comma-separated translation IDs to include. " +
-        "Examples: 'en', 'en,sc', 'en,ur'. " +
-        "Available: en, zk, sc, v5, ur, ts, fr, es, de, it, my, bn, cn, nw, sv"
-      ),
-  },
-  async ({ chapter, from_verse, to_verse, translations }) => {
-    const opts = buildOptions(translations);
-    const verses = await getVerses(chapter, from_verse, to_verse, opts);
-    const chapterMeta = CHAPTERS[chapter - 1];
-    const header = `${chapterMeta.name} (Chapter ${chapter}) — Verses ${from_verse}–${to_verse}\n${"─".repeat(60)}`;
-    const body = formatVerses(verses, translations);
-    return { content: [{ type: "text", text: `${header}\n${body}` }] };
+  for (const ch of SEED_CHAPTERS) {
+    if (await cache.isIntroCached(ch)) continue;
+    try {
+      const introData = await fetchIntro(ch);
+      await cache.saveIntro({
+        chapter: ch,
+        cached_at: new Date().toISOString(),
+        ...introData,
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (err) {
+      console.error(`Failed to seed intro ${ch}:`, err);
+    }
   }
-);
 
-// ---------------------------------------------------------------------------
-// Tool: get_chapter
-// ---------------------------------------------------------------------------
-
-server.tool(
-  "get_chapter",
-  "Retrieve an entire chapter (surah) of the Holy Quran.",
-  {
-    chapter: z
-      .number()
-      .int()
-      .min(1)
-      .max(114)
-      .describe("Chapter (surah) number, 1–114"),
-    translations: z
-      .string()
-      .optional()
-      .default("en")
-      .describe("Comma-separated translation IDs (e.g. 'en', 'en,sc')"),
-  },
-  async ({ chapter, translations }) => {
-    const meta = CHAPTERS[chapter - 1];
-    const opts = buildOptions(translations);
-    const verses = await getVerses(chapter, 1, meta.verses, opts);
-    const header = `${meta.name} (Chapter ${chapter}, ${meta.type}) — ${meta.verses} verses\n${"─".repeat(60)}`;
-    const body = formatVerses(verses, translations);
-    return { content: [{ type: "text", text: `${header}\n${body}` }] };
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: get_chapter_intro
-// ---------------------------------------------------------------------------
-
-server.tool(
-  "get_chapter_intro",
-  "Get the scholarly introduction to a chapter of the Quran, covering history, names, and subject matter. Content from the Five Volume Commentary (Ahmadiyya Muslim Community).",
-  {
-    chapter: z
-      .number()
-      .int()
-      .min(1)
-      .max(114)
-      .describe("Chapter (surah) number, 1–114"),
-    language: z
-      .enum(["en", "ur"])
-      .optional()
-      .default("en")
-      .describe("Language for the introduction: 'en' (English) or 'ur' (Urdu)"),
-  },
-  async ({ chapter, language }) => {
-    const intro = await getChapterIntro(chapter);
-    const html = language === "ur" ? intro.intro_ur : intro.intro_en;
-    // Strip HTML tags for clean text
-    const clean = html
-      .replace(/<h[1-6][^>]*>/gi, "\n\n### ")
-      .replace(/<\/h[1-6]>/gi, "\n")
-      .replace(/<p[^>]*>/gi, "\n")
-      .replace(/<\/p>/gi, "\n")
-      .replace(/<i>/gi, "_")
-      .replace(/<\/i>/gi, "_")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-    const header = `### ${intro.chapter_name} — Chapter ${chapter} Introduction\n${"─".repeat(60)}`;
-    return { content: [{ type: "text", text: `${header}\n${clean}` }] };
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: search_quran
-// ---------------------------------------------------------------------------
-
-server.tool(
-  "search_quran",
-  'Search for a word, phrase, or topic across the Holy Quran. Wrap a phrase in quotes for exact matching, e.g. "in the name of Allah". Supports AI-enhanced contextual search.',
-  {
-    query: z
-      .string()
-      .min(1)
-      .describe(
-        'Search term or phrase. Use quotes for exact phrase search, e.g. "believers who do good"'
-      ),
-    translations: z
-      .string()
-      .optional()
-      .default("en")
-      .describe("Comma-separated translation IDs to search within and return (e.g. 'en', 'en,sc')"),
-    ai: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Use AI-enhanced contextual/semantic search (default: false = keyword search)"),
-    max_results: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .optional()
-      .default(10)
-      .describe("Maximum number of verses to return (1–50, default: 10)"),
-  },
-  async ({ query, translations, ai, max_results }) => {
-    const opts = buildOptions(translations);
-    const result = await searchQuran(query, opts, ai);
-    const shown = result.verses.slice(0, max_results);
-    const header =
-      `Search: "${query}" — ${result.total_hits} total hits (showing ${shown.length})\n` +
-      `${"─".repeat(60)}`;
-    const body = formatVerses(shown, translations);
-    return { content: [{ type: "text", text: `${header}\n${body}` }] };
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Start the server
-// ---------------------------------------------------------------------------
+  await cache.updateStatus({ seed_complete: true, seed_in_progress: false });
+}
 
 async function main() {
+  await cache.init();
+  seedCache().catch(err => console.error('Seed error:', err));
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Use stderr so it doesn't pollute the MCP stdio channel
-  process.stderr.write("Quran MCP server running\n");
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal: ${err}\n`);
-  process.exit(1);
-});
+main().catch(console.error);
